@@ -1,0 +1,17 @@
+# SpectraMining AI — pinned dependencies
+# Install with:  pip install -r requirements.txt
+
+streamlit>=1.32.0
+earthengine-api>=0.1.390
+geopy>=2.4.0
+
+# branca + jinja2 are required for the MacroElement tile injection fix
+branca>=0.7.0
+jinja2>=3.0.0
+
+# --- Map rendering ---
+# The app uses AllTilesElement (MacroElement + raw Leaflet JS) so it works
+# with ANY folium version. However, pinning to these versions is the safest
+# option if you want to avoid any other folium >= 0.18 surprises.
+folium==0.14.0
+streamlit-folium==0.15.0
