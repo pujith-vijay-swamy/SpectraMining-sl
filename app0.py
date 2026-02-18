@@ -3,6 +3,7 @@ import logging
 warnings.filterwarnings('ignore')
 logging.getLogger('streamlit').setLevel(logging.ERROR)
 
+import json
 import streamlit as st
 import ee
 import folium
@@ -18,30 +19,9 @@ from legal_mining_sites import LEGAL_MINING_AREAS
 
 # ---------------------------------------------------------------------------
 # DEFINITIVE FIX for folium >= 0.18 + streamlit-folium JSON serialization crash.
-#
-# Root cause: In folium >= 0.18, BOTH the base map tiles (tiles='OpenStreetMap')
-# AND TileLayer objects store internal TileProvider/callable objects that cannot
-# be JSON-serialized by streamlit-folium's st_folium().
-#
-# Solution: Use folium.Map(tiles=None) and inject ALL tile layers + LayerControl
-# as a single MacroElement containing pure JavaScript. The MacroElement template
-# outputs only strings — never Python callables — so serialization always works.
 # ---------------------------------------------------------------------------
 
 class AllTilesElement(MacroElement):
-    """
-    Injects ALL map tile layers and a Leaflet LayerControl as raw JavaScript.
-    This completely bypasses folium's TileLayer / LayerControl serialization,
-    which breaks in folium >= 0.18 with streamlit-folium.
-
-    Parameters
-    ----------
-    true_color_url   : GEE tile URL string for True Color layer
-    mineral_url      : GEE tile URL string for active mineral heatmap
-    mineral_label    : Display name for the mineral heatmap layer
-    false_color_url  : GEE tile URL string for False Color layer
-    mineral_opacity  : Opacity for the mineral heatmap (default 0.7)
-    """
     def __init__(self, true_color_url, mineral_url, mineral_label,
                  false_color_url, mineral_opacity=0.7):
         super().__init__()
@@ -54,7 +34,6 @@ class AllTilesElement(MacroElement):
 
         self._template = Template(u"""
 {% macro script(this, kwargs) %}
-// ── Base tile layers ─────────────────────────────────────────────────────────
 var osmLayer = L.tileLayer(
     "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
     {maxZoom: 19, attribution: "© OpenStreetMap contributors"}
@@ -67,8 +46,6 @@ var gHybridLayer = L.tileLayer(
     "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
     {maxZoom: 22, attribution: "Google Maps"}
 );
-
-// ── GEE overlay layers ───────────────────────────────────────────────────────
 var trueColorLayer = L.tileLayer(
     "{{ this.true_color_url }}",
     {opacity: 1.0, attribution: "ESA Sentinel-2 / Google Earth Engine"}
@@ -81,13 +58,9 @@ var falseColorLayer = L.tileLayer(
     "{{ this.false_color_url }}",
     {opacity: 1.0, attribution: "ESA Sentinel-2 / Google Earth Engine"}
 );
-
-// ── Add default visible layers ───────────────────────────────────────────────
 osmLayer.addTo({{ this._parent.get_name() }});
 trueColorLayer.addTo({{ this._parent.get_name() }});
 mineralLayer.addTo({{ this._parent.get_name() }});
-
-// ── Layer Control ─────────────────────────────────────────────────────────────
 var baseLayers = {
     "OpenStreetMap": osmLayer,
     "Google Satellite": gSatLayer,
@@ -105,19 +78,33 @@ L.control.layers(baseLayers, overlayLayers, {collapsed: false}).addTo(
 """)
 
 
-
 # --- CONFIGURATION ---
 MY_PROJECT_ID = "spectramining"
 geolocator = Nominatim(user_agent="spectramining_ai_pro_v6")
 
+
+# ---------------------------------------------------------------------------
+# Earth Engine Initialization (Service Account via Streamlit Secrets)
+# ---------------------------------------------------------------------------
+@st.cache_resource
+def init_gee():
+    try:
+        service_account_info = dict(st.secrets["ee_service_account"])
+        credentials = ee.ServiceAccountCredentials(
+            email=service_account_info["client_email"],
+            key_data=json.dumps(service_account_info)
+        )
+        ee.Initialize(credentials)
+        return True
+    except Exception as e:
+        st.error(f"⚠️ Earth Engine Initialization Failed: {e}")
+        return False
+
+
 def get_nearby_places(lat, lon, radius_km=5):
-    """
-    Get nearby points of interest (Google Maps style)
-    """
     try:
         query = f"{lat},{lon}"
         results = geolocator.reverse(query, exactly_one=False, language='en', addressdetails=True)
-        
         nearby_places = []
         if results:
             for result in results[:10]:
@@ -125,7 +112,6 @@ def get_nearby_places(lat, lon, radius_km=5):
                     address = result.raw['address']
                     place_name = None
                     place_type = None
-                    
                     if 'mall' in address or 'shopping' in address.get('amenity', '').lower():
                         place_name = address.get('mall', address.get('shop', address.get('amenity')))
                         place_type = "Shopping"
@@ -141,7 +127,6 @@ def get_nearby_places(lat, lon, radius_km=5):
                     elif 'building' in address:
                         place_name = address.get('building')
                         place_type = "Landmark"
-                    
                     if place_name and place_name not in [p['name'] for p in nearby_places]:
                         nearby_places.append({
                             'name': place_name,
@@ -149,16 +134,12 @@ def get_nearby_places(lat, lon, radius_km=5):
                             'lat': result.latitude,
                             'lon': result.longitude
                         })
-        
         return nearby_places[:5]
     except:
         return []
 
 
 def get_mineral_index_at_point(mineral_index_ee, lat, lon, mineral_name='iron'):
-    """
-    Get mineral index value at a specific point
-    """
     try:
         point = ee.Geometry.Point([lon, lat])
         sample = mineral_index_ee.sample(region=point, scale=10, geometries=True).first()
@@ -171,17 +152,6 @@ def get_mineral_index_at_point(mineral_index_ee, lat, lon, mineral_name='iron'):
 
 
 def classify_location(lat, lon, mineral_coverage, mineral_name='iron'):
-    """
-    AI Classification based on proximity to legal mining areas and mineral detection.
-    
-    Returns
-    -------
-    classification      : str   — human-readable label
-    classification_type : str   — one of 'mining', 'high_potential', 'moderate_potential', 'low_potential'
-    nearby_mines        : list  — mines within 15 km that match the mineral type
-    nearest_distance    : float — km to nearest matching mine (None if no matching mines at all)
-    nearest_mine        : str   — name of nearest matching mine (None if no matching mines at all)
-    """
     search_point = (lat, lon)
     nearby_mines = []
     min_distance = float('inf')
@@ -200,10 +170,8 @@ def classify_location(lat, lon, mineral_coverage, mineral_name='iron'):
         is_match = any(t.lower() in mine_type.lower() for t in target_types)
         if not is_match:
             continue
-
         mine_point = (mine_lat, mine_lon)
         distance = geodesic(search_point, mine_point).kilometers
-
         if distance <= 15:
             nearby_mines.append({
                 'name':     mine_name,
@@ -211,13 +179,10 @@ def classify_location(lat, lon, mineral_coverage, mineral_name='iron'):
                 'country':  country,
                 'type':     mine_type
             })
-
-        # Track nearest matching mine, but only show it when meaningfully close (< 200 km)
         if distance < min_distance:
             min_distance = distance
             nearest_mine = mine_name
 
-    # If nearest matching mine is too far to be relevant, suppress it
     if min_distance > 200:
         nearest_mine = None
         nearest_distance = None
@@ -229,9 +194,6 @@ def classify_location(lat, lon, mineral_coverage, mineral_name='iron'):
         classification_type = "mining"
     else:
         mineral_display = mineral_name.capitalize()
-        # Coverage thresholds calibrated per-mineral:
-        # iron  : Red/Blue ratio readily saturates → use tighter bands
-        # al/cu : indices noisier → slightly more lenient
         thresholds = {
             'iron':      (15.0, 5.0, 1.0),
             'aluminum':  (12.0, 3.0, 0.5),
@@ -257,17 +219,7 @@ def classify_location(lat, lon, mineral_coverage, mineral_name='iron'):
     return classification, classification_type, nearby_mines, nearest_distance, nearest_mine
 
 
-@st.cache_resource
-def init_gee():
-    try:
-        ee.Initialize(project=MY_PROJECT_ID)
-        return True
-    except Exception as e:
-        st.error(f"⚠️ Earth Engine Initialization Failed: {e}")
-        return False
-
-
-# Initialize session state
+# --- Initialize session state ---
 if 'analysis_complete' not in st.session_state:
     st.session_state.analysis_complete = False
 if 'results' not in st.session_state:
@@ -286,14 +238,9 @@ st.set_page_config(
 )
 
 # --- CUSTOM CSS ---
-# FIX 3: Heading CSS — use a more specific selector so the gradient is not
-#         overridden by the broad `h1 { color: #FFE66D !important }` rule.
-#         Adding `!important` to the background properties and using both
-#         prefixed and unprefixed background-clip ensures gradient text renders.
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap');
-    /* Sidebar Toggle Button */
     [data-testid="collapsedControl"] {
         background: linear-gradient(135deg, #E63946 0%, #FF6B6B 100%) !important;
         border-radius: 0 10px 10px 0 !important;
@@ -302,19 +249,12 @@ st.markdown("""
         box-shadow: 0 4px 12px rgba(230, 57, 70, 0.4) !important;
         transition: all 0.3s ease !important;
     }
-
-    /* Fix header visibility */
-    header[data-testid="stHeader"] {
-        visibility: hidden;
-    }
-    
+    header[data-testid="stHeader"] { visibility: hidden; }
     .stApp {
         background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 50%, #2d1b3d 100%);
     }
-    
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    
     .main-header {
         text-align: center;
         padding: 1rem 0;
@@ -324,9 +264,6 @@ st.markdown("""
         border: 2px solid rgba(230, 57, 70, 0.3);
         box-shadow: 0 8px 32px rgba(230, 57, 70, 0.2);
     }
-
-    /* FIX 3: More specific selector beats the broad h1 rule below.
-       Also adding both webkit and standard background-clip for max compat. */
     .main-header .main-title {
         font-family: 'Orbitron', sans-serif !important;
         font-size: 3rem !important;
@@ -340,7 +277,6 @@ st.markdown("""
         letter-spacing: 2px !important;
         display: inline-block !important;
     }
-    
     .subtitle {
         font-family: 'Rajdhani', sans-serif;
         font-size: 1.1rem;
@@ -349,19 +285,16 @@ st.markdown("""
         margin-top: 0.5rem;
         letter-spacing: 1px;
     }
-    
     [data-testid="stSidebar"] {
         background: linear-gradient(180deg, #1a1f3a 0%, #2d1b3d 100%);
         border-right: 2px solid rgba(230, 57, 70, 0.3);
     }
-    
     [data-testid="stSidebar"] h1, 
     [data-testid="stSidebar"] h2,
     [data-testid="stSidebar"] h3 {
         color: #FFE66D !important;
         font-family: 'Orbitron', sans-serif;
     }
-    
     .stTextInput input {
         background: rgba(255, 255, 255, 0.05) !important;
         border: 2px solid rgba(230, 57, 70, 0.3) !important;
@@ -371,7 +304,6 @@ st.markdown("""
         font-size: 1.1rem;
         padding: 0.75rem !important;
     }
-    
     .stButton button {
         background: linear-gradient(135deg, #E63946 0%, #FF6B6B 100%) !important;
         color: white !important;
@@ -385,12 +317,10 @@ st.markdown("""
         transition: all 0.3s ease;
         letter-spacing: 2px;
     }
-    
     .stButton button:hover {
         transform: translateY(-3px);
         box-shadow: 0 12px 40px rgba(230, 57, 70, 0.6);
     }
-    
     [data-testid="stMetric"] {
         background: rgba(230, 57, 70, 0.1);
         padding: 1rem;
@@ -399,32 +329,26 @@ st.markdown("""
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
         margin-bottom: 0.5rem;
     }
-    
     [data-testid="stMetric"] label {
         color: #A8DADC !important;
         font-family: 'Rajdhani', sans-serif;
         font-size: 0.9rem !important;
         font-weight: 600;
     }
-    
     [data-testid="stMetric"] [data-testid="stMetricValue"] {
         color: #FFE66D !important;
         font-family: 'Orbitron', sans-serif;
         font-size: 1.8rem !important;
         font-weight: 700;
     }
-    
     .stProgress > div > div {
         background: linear-gradient(90deg, #E63946 0%, #FF6B6B 50%, #FFE66D 100%);
         border-radius: 10px;
     }
-    
-    /* Keep generic h1/h2/h3 for sidebar and other sections */
     h1, h2, h3 {
         font-family: 'Orbitron', sans-serif !important;
         color: #FFE66D !important;
     }
-    
     .stats-card {
         background: linear-gradient(135deg, rgba(230, 57, 70, 0.1) 0%, rgba(69, 123, 157, 0.1) 100%);
         padding: 1.5rem;
@@ -433,7 +357,6 @@ st.markdown("""
         margin: 1rem 0;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
     }
-    
     .stats-title {
         font-family: 'Orbitron', sans-serif;
         color: #FFE66D;
@@ -441,25 +364,13 @@ st.markdown("""
         font-weight: 700;
         margin-bottom: 0.5rem;
     }
-    
     .block-container {
         padding-top: 1rem;
         padding-bottom: 1rem;
     }
-    
-    iframe {
-        display: block;
-        margin: 0;
-        padding: 0;
-    }
-    
-    div[data-testid="stHorizontalBlock"] {
-        gap: 1rem;
-    }
-    
-    .element-container {
-        margin-bottom: 0.5rem;
-    }
+    iframe { display: block; margin: 0; padding: 0; }
+    div[data-testid="stHorizontalBlock"] { gap: 1rem; }
+    .element-container { margin-bottom: 0.5rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -481,7 +392,6 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
     
-    # Location Search
     st.markdown("#### 📍 Location")
     search_query = st.text_input(
         "Search Site or Region",
@@ -494,7 +404,6 @@ with st.sidebar:
     if 'last_search_query' not in st.session_state:
         st.session_state.last_search_query = ""
     
-    # New Analysis button - RIGHT AFTER search, before divider
     if st.session_state.analysis_complete:
         if st.button("🔄 New Analysis", use_container_width=True, key="new_analysis"):
             if search_query != st.session_state.last_search_query:
@@ -507,9 +416,7 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # MINERAL SELECTOR — 5 clean text buttons, no emojis
     st.markdown("#### 🧪 Active Mineral")
-
     _MINERALS = [
         ('iron',      'Fe · Iron'),
         ('aluminum',  'Al · Aluminum'),
@@ -538,7 +445,6 @@ with st.sidebar:
 
     selected_mineral_key = st.session_state.selected_mineral
 
-    # Fixed High-sensitivity thresholds — no slider needed
     FIXED_THRESHOLDS = {
         'iron': 1.3, 'aluminum': 1.2, 'copper': 1.5,
         'limestone': 1.2, 'manganese': 0.5,
@@ -548,7 +454,6 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # Time Range Selection
     st.markdown("#### 📅 Imagery Period")
     date_range = st.selectbox(
         "Time Range",
@@ -566,7 +471,6 @@ with st.sidebar:
     }
     start_date = date_map[date_range]
     
-    # Fixed cloud threshold (NO SLIDER)
     cloud_threshold = 40
     st.caption("☁️ **Cloud Filter:** Fixed at < 40% (Optimal Quality)")
     
@@ -598,7 +502,6 @@ scan_button = st.button("🚀 INITIATE SCAN", use_container_width=True, disabled
 should_scan = (scan_button or st.session_state.trigger_scan) and not st.session_state.analysis_complete
 
 if should_scan:
-    
     st.session_state.trigger_scan = False
     
     if not init_gee():
@@ -617,7 +520,6 @@ if should_scan:
             st.stop()
         
         st.session_state.last_search_query = search_query
-        
         st.success(f"✓ Location Found: **{location.address}**")
         progress_bar.progress(20)
         
@@ -627,7 +529,6 @@ if should_scan:
         progress_bar.progress(30)
         
         status_text.markdown("**🛰️ Fetching Sentinel-2 SR Harmonized imagery...**")
-        
         s2_col = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
                   .filterBounds(region)
                   .filterDate(start_date, '2026-02-15')
@@ -646,13 +547,9 @@ if should_scan:
         
         s2_img = s2_col.median().divide(10000).clip(region)
         
-        status_text.markdown("**🧪 Computing multi-mineral spectral signatures...**")
-        progress_bar.progress(60)
-        
         status_text.markdown("**🧪 Computing spectral indices...**")
         progress_bar.progress(60)
 
-        # Build all 5 spectral indices (pure EE graph — no network yet)
         red_band   = s2_img.select('B4')
         blue_band  = s2_img.select('B2')
         green_band = s2_img.select('B3')
@@ -667,15 +564,12 @@ if should_scan:
         limestone_index = swir1_band.divide(swir2_band.add(1e-6)).rename('limestone_index')
         manganese_index = red_band.divide(swir1_band.add(1e-6)).rename('manganese_index')
 
-        # Fixed High-sensitivity thresholds
         iron_threshold_value      = 1.3
         aluminum_threshold_value  = 1.2
         copper_threshold_value    = 1.5
         limestone_threshold_value = 1.2
         manganese_threshold_value = 0.5
 
-        # ── BATCH 1: stats for all 5 minerals in ONE getInfo() ───────────────
-        # Previously 5 separate round-trips; now a single call → ~5× faster.
         status_text.markdown("**📊 Fetching statistics (batched)...**")
         all_indices = ee.Image.cat([
             iron_index, aluminum_index, copper_index,
@@ -685,7 +579,7 @@ if should_scan:
             reducer=(ee.Reducer.percentile([10, 90])
                      .combine(ee.Reducer.mean(), '', True)),
             geometry=region,
-            scale=60,        # 60 m: 4× fewer pixels than 30 m, negligible loss
+            scale=60,
             maxPixels=1e9,
             bestEffort=True
         ).getInfo()
@@ -701,7 +595,6 @@ if should_scan:
 
         progress_bar.progress(70)
 
-        # ── BATCH 2: coverage for all 5 minerals in ONE getInfo() ────────────
         status_text.markdown("**🗺️ Computing coverage (batched)...**")
         cov_img = ee.Image.cat([
             iron_index.gt(iron_threshold_value).rename('iron_cov'),
@@ -768,7 +661,6 @@ if should_scan:
         
         progress_bar.progress(90)
         
-        # Store EE objects in session state for point queries
         st.session_state.iron_index_ee      = iron_index
         st.session_state.aluminum_index_ee  = aluminum_index
         st.session_state.copper_index_ee    = copper_index
@@ -776,7 +668,6 @@ if should_scan:
         st.session_state.manganese_index_ee = manganese_index
         st.session_state.s2_img_ee          = s2_img
 
-        # AI Classification for the currently selected mineral
         mineral_coverage_for_classification = {
             'iron':      iron_coverage,
             'aluminum':  aluminum_coverage,
@@ -792,29 +683,24 @@ if should_scan:
             selected_mineral_key
         )
 
-        # Store results — tile URLs stored as strings (url_format), NOT raw dicts
         st.session_state.results = {
             'location':   location,
             'num_images': num_images,
-            # coverages
             'iron_coverage':       iron_coverage,
             'aluminum_coverage':   aluminum_coverage,
             'copper_coverage':     copper_coverage,
             'limestone_coverage':  limestone_coverage,
             'manganese_coverage':  manganese_coverage,
-            # stats
             'iron_stats':      iron_stats,
             'aluminum_stats':  aluminum_stats,
             'copper_stats':    copper_stats,
             'limestone_stats': limestone_stats,
             'manganese_stats': manganese_stats,
-            # thresholds
             'iron_threshold':      iron_threshold_value,
             'aluminum_threshold':  aluminum_threshold_value,
             'copper_threshold':    copper_threshold_value,
             'limestone_threshold': limestone_threshold_value,
             'manganese_threshold': manganese_threshold_value,
-            # tile URLs
             'true_color_tile':  true_color_tile['tile_fetcher'].url_format,
             'false_color_tile': false_color_tile['tile_fetcher'].url_format,
             'iron_tile':        iron_tile['tile_fetcher'].url_format,
@@ -822,17 +708,14 @@ if should_scan:
             'copper_tile':      copper_tile['tile_fetcher'].url_format,
             'limestone_tile':   limestone_tile['tile_fetcher'].url_format,
             'manganese_tile':   manganese_tile['tile_fetcher'].url_format,
-            # viz ranges
             'iron_min': iron_min,           'iron_max': iron_max,
             'aluminum_min': aluminum_min,   'aluminum_max': aluminum_max,
             'copper_min': copper_min,       'copper_max': copper_max,
             'limestone_min': limestone_min, 'limestone_max': limestone_max,
             'manganese_min': manganese_min, 'manganese_max': manganese_max,
-            # misc
             'start_date':      start_date,
             'cloud_threshold': cloud_threshold,
             'region':          region,
-            # classification
             'classification':         classification,
             'classification_type':    class_type,
             'nearby_mines':           nearby_mines,
@@ -846,10 +729,8 @@ if should_scan:
         
         progress_bar.progress(100)
         status_text.markdown("**✅ Analysis Complete!**")
-        
         progress_bar.empty()
         status_text.empty()
-        
         st.rerun()
         
     except Exception as e:
@@ -861,7 +742,6 @@ if st.session_state.analysis_complete and st.session_state.results:
     
     results = st.session_state.results
     location = results['location']
-    
     current_mineral = st.session_state.selected_mineral
     
     mineral_config = {
@@ -875,9 +755,6 @@ if st.session_state.analysis_complete and st.session_state.results:
     config = mineral_config[current_mineral]
     current_coverage = results[f'{current_mineral}_coverage']
 
-    # ── Re-classify if the active mineral changed since last classification ──────
-    # The initial scan classifies for `selected_mineral_key` at scan time.
-    # When the user switches Fe → Al → Cu the stored classification becomes stale.
     if results.get('classified_for_mineral') != current_mineral:
         classification, class_type, nearby_mines, nearest_distance, nearest_mine = classify_location(
             location.latitude,
@@ -905,11 +782,8 @@ if st.session_state.analysis_complete and st.session_state.results:
             st.markdown(f"""
             <div style="
                 background: linear-gradient(135deg, rgba(76, 175, 80, 0.2) 0%, rgba(56, 142, 60, 0.2) 100%);
-                padding: 1.2rem;
-                border-radius: 12px;
-                border: 3px solid #4CAF50;
-                margin-bottom: 1rem;
-                box-shadow: 0 6px 24px rgba(76, 175, 80, 0.4);
+                padding: 1.2rem; border-radius: 12px; border: 3px solid #4CAF50;
+                margin-bottom: 1rem; box-shadow: 0 6px 24px rgba(76, 175, 80, 0.4);
             ">
                 <div style="font-family: 'Orbitron', sans-serif; color: #4CAF50; font-size: 0.85rem; font-weight: 700; margin-bottom: 0.3rem;">🤖 AI CLASSIFICATION</div>
                 <div style="font-family: 'Orbitron', sans-serif; color: #66BB6A; font-size: 1.1rem; font-weight: 900;">⚖️ LEGAL MINING</div>
@@ -933,11 +807,8 @@ if st.session_state.analysis_complete and st.session_state.results:
             st.markdown(f"""
             <div style="
                 background: linear-gradient(135deg, rgba(33, 150, 243, 0.2) 0%, rgba(25, 118, 210, 0.2) 100%);
-                padding: 1.2rem;
-                border-radius: 12px;
-                border: 3px solid {color};
-                margin-bottom: 1rem;
-                box-shadow: 0 6px 24px rgba(33, 150, 243, 0.4);
+                padding: 1.2rem; border-radius: 12px; border: 3px solid {color};
+                margin-bottom: 1rem; box-shadow: 0 6px 24px rgba(33, 150, 243, 0.4);
             ">
                 <div style="font-family: 'Orbitron', sans-serif; color: {color}; font-size: 0.85rem; font-weight: 700; margin-bottom: 0.3rem;">🤖 AI CLASSIFICATION</div>
                 <div style="font-family: 'Orbitron', sans-serif; color: {color}; font-size: 0.95rem; font-weight: 900; text-transform: uppercase;">{icon} {classification.replace('Natural - ', '')}</div>
@@ -1005,8 +876,6 @@ if st.session_state.analysis_complete and st.session_state.results:
     with col1:
         st.markdown(f"### 🗺️ {config['symbol']} {config['name'].upper()} SATELLITE VIEW - {location.address.split(',')[0]}")
         
-        # tiles=None prevents folium from creating ANY internal TileProvider callable.
-        # All tile layers are injected via AllTilesElement (pure JS, no Python callables).
         m = folium.Map(
             location=[location.latitude, location.longitude],
             zoom_start=13,
@@ -1014,7 +883,6 @@ if st.session_state.analysis_complete and st.session_state.results:
             control_scale=True
         )
 
-        # Inject all tile layers + layer control as raw Leaflet JS — zero callables.
         mineral_label = f"🔬 {config['name']} ({config['abbr']}) Heatmap"
         mineral_tile_url = results[f'{current_mineral}_tile']
         AllTilesElement(
@@ -1030,18 +898,14 @@ if st.session_state.analysis_complete and st.session_state.results:
         
         if nearby_places:
             for place in nearby_places:
-                # FIX: Use Bootstrap icon names (no prefix='fa') — FontAwesome prefix
-                # triggers an internal callable in folium >= 0.18 that breaks JSON serialization.
                 icon_map = {
-                    'Shopping': {'color': 'blue', 'icon': 'shopping-cart'},
-                    'Education': {'color': 'purple', 'icon': 'book'},
-                    'Healthcare': {'color': 'red', 'icon': 'plus-sign'},
-                    'Hospitality': {'color': 'orange', 'icon': 'cutlery'},
-                    'Landmark': {'color': 'lightgray', 'icon': 'home'}
+                    'Shopping':    {'color': 'blue',      'icon': 'shopping-cart'},
+                    'Education':   {'color': 'purple',    'icon': 'book'},
+                    'Healthcare':  {'color': 'red',       'icon': 'plus-sign'},
+                    'Hospitality': {'color': 'orange',    'icon': 'cutlery'},
+                    'Landmark':    {'color': 'lightgray', 'icon': 'home'}
                 }
-                
                 icon_config = icon_map.get(place['type'], {'color': 'lightgray', 'icon': 'map-marker'})
-                
                 folium.Marker(
                     [place['lat'], place['lon']],
                     popup=folium.Popup(f"""
@@ -1054,8 +918,6 @@ if st.session_state.analysis_complete and st.session_state.results:
                     tooltip=f"📍 {place['name']}",
                     icon=folium.Icon(color=icon_config['color'], icon=icon_config['icon'])
                 ).add_to(m)
-        
-        # Tile layers are handled by AllTilesElement above — no separate calls needed.
         
         folium.Marker(
             [location.latitude, location.longitude],
@@ -1097,7 +959,6 @@ if st.session_state.analysis_complete and st.session_state.results:
                     if mine_name == mine['name']:
                         mine_coords = (lat, lon)
                         break
-                
                 if mine_coords:
                     folium.Marker(
                         mine_coords,
@@ -1115,9 +976,6 @@ if st.session_state.analysis_complete and st.session_state.results:
                         icon=folium.Icon(color='green', icon='star')
                     ).add_to(m)
         
-        # LayerControl is injected via AllTilesElement JS above — no folium.LayerControl needed.
-        
-        # FIX 1: st_folium is now properly inside `with col1:` (not in a broken container)
         map_data = st_folium(m, width=None, height=600, key="main_map", returned_objects=["last_clicked"])
         
         if map_data and map_data.get("last_clicked"):
@@ -1131,11 +989,8 @@ if st.session_state.analysis_complete and st.session_state.results:
             st.markdown(f"""
             <div style="
                 background: linear-gradient(135deg, rgba(33, 150, 243, 0.15) 0%, rgba(25, 118, 210, 0.15) 100%);
-                padding: 1.2rem;
-                border-radius: 12px;
-                border: 2px solid {config['color']};
-                margin-top: 1rem;
-                box-shadow: 0 4px 16px rgba(33, 150, 243, 0.3);
+                padding: 1.2rem; border-radius: 12px; border: 2px solid {config['color']};
+                margin-top: 1rem; box-shadow: 0 4px 16px rgba(33, 150, 243, 0.3);
             ">
                 <div style="font-family: 'Orbitron', sans-serif; color: {config['color']}; font-size: 1rem; font-weight: 700; margin-bottom: 0.8rem;">
                     📍 {config['symbol']} {config['name'].upper()} AT SELECTED LOCATION
@@ -1144,7 +999,6 @@ if st.session_state.analysis_complete and st.session_state.results:
             """, unsafe_allow_html=True)
             
             col_click1, col_click2, col_click3 = st.columns(3)
-            
             with col_click1:
                 st.metric("Latitude", f"{clicked_lat:.6f}°", delta="N")
             with col_click2:
@@ -1188,11 +1042,8 @@ if st.session_state.analysis_complete and st.session_state.results:
                             st.markdown(f"""
                             <div style="
                                 background: linear-gradient(135deg, rgba(230, 57, 70, 0.15) 0%, rgba(255, 107, 107, 0.15) 100%);
-                                padding: 1.2rem;
-                                border-radius: 12px;
-                                border: 3px solid {point_color};
-                                margin-top: 1rem;
-                                box-shadow: 0 6px 20px rgba(230, 57, 70, 0.3);
+                                padding: 1.2rem; border-radius: 12px; border: 3px solid {point_color};
+                                margin-top: 1rem; box-shadow: 0 6px 20px rgba(230, 57, 70, 0.3);
                             ">
                                 <div style="font-family: 'Orbitron', sans-serif; color: {point_color}; font-size: 0.9rem; font-weight: 700; margin-bottom: 0.5rem;">
                                     🔬 {config['name'].upper()} INDEX AT THIS POINT
@@ -1214,14 +1065,12 @@ if st.session_state.analysis_complete and st.session_state.results:
                             """, unsafe_allow_html=True)
                             
                             col_info1, col_info2 = st.columns(2)
-                            
                             with col_info1:
                                 if has_mineral:
                                     mineral_percent = ((mineral_value - current_threshold) / (3.5 - current_threshold)) * 100
                                     st.metric("Relative Strength", f"{min(mineral_percent, 100):.1f}%", delta="above threshold")
                                 else:
                                     st.metric("Status", "No Detection", delta="below threshold")
-                            
                             with col_info2:
                                 area_mean = results.get(f'{current_mineral}_stats', {}).get(f'{current_mineral}_index_mean', 1.5)
                                 diff = mineral_value - area_mean
@@ -1240,7 +1089,6 @@ if st.session_state.analysis_complete and st.session_state.results:
                                 st.info(f"📊 **Detected:** {config['name']} signature above threshold.")
                             else:
                                 st.info(f"🌍 **Natural:** {config['name']} content below detection threshold.")
-                        
                         else:
                             st.warning(f"⚠️ Could not retrieve {config['name']} index. Try a different spot.")
             else:
@@ -1272,7 +1120,6 @@ if st.session_state.analysis_complete and st.session_state.results:
         st.info(f"💡 Use layer panel to toggle True Color, {config['name']} Heatmap, and False Color.")
     
     st.markdown("### 📋 TECHNICAL DETAILS")
-    
     col_a, col_b, col_c = st.columns(3)
     
     with col_a:
@@ -1293,7 +1140,6 @@ if st.session_state.analysis_complete and st.session_state.results:
             'limestone': 'Carbonate: SWIR1/SWIR2 (B11/B12)',
             'manganese': 'MnOx: Red/SWIR1 (B4/B11)',
         }
-        
         st.markdown(f"""
         **Analysis Method:**
         - Mineral: {config['name']} ({config['abbr']})
@@ -1320,4 +1166,3 @@ st.markdown("""
     <p style="font-size: 0.9rem;">Advanced satellite-based multi-mineral exploration technology</p>
 </div>
 """, unsafe_allow_html=True)
-#python -m streamlit run app.py
