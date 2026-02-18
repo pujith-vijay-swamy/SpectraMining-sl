@@ -90,6 +90,10 @@ geolocator = Nominatim(user_agent="spectramining_ai_pro_v6")
 def init_gee():
     try:
         service_account_info = dict(st.secrets["ee_service_account"])
+
+        # Fix: Streamlit secrets stores \n as literal text — convert to real newlines
+        service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+
         credentials = ee.ServiceAccountCredentials(
             email=service_account_info["client_email"],
             key_data=json.dumps(service_account_info)
