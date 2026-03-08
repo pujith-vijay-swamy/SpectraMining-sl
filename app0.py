@@ -1320,4 +1320,5 @@ st.markdown("""
     <p style="font-size: 0.9rem;">Advanced satellite-based multi-mineral exploration technology</p>
 </div>
 """, unsafe_allow_html=True)
-#python -m streamlit run app.py
+#python -m streamlit run app0.py
+
